@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>小鲸鱼回复门控 · 控制面板</title>
+  <link rel="stylesheet" href="settings.css">
+  <script src="settings.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>回复门控设置</h1>
+      <p>这里和插件“设置”共用全部参数，保存后立即应用。</p>
+    </header>
+    <section class="status" aria-labelledby="status-title">
+      <h2 id="status-title">当前状态</h2>
+      <p id="current-status" role="status">正在加载配置…</p>
+    </section>
+    <form id="settings-form">
+      <fieldset id="settings-fields" disabled>
+        <legend class="sr-only">完整门控配置</legend>
+        <div id="config-fields"></div>
+        <button id="save-settings" class="primary" type="submit">保存并应用</button>
+      </fieldset>
+    </form>
+    <p id="feedback" role="status" aria-live="polite"></p>
+  </main>
+</body>
+</html>

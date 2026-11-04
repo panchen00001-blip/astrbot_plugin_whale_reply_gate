@@ -1,0 +1,10 @@
+{
+  "views": {
+    "settings": {
+      "title": "控制面板"
+    }
+  },
+  "pages": {
+    "settings": "控制面板"
+  }
+}

@@ -1,0 +1,9 @@
+name: astrbot_plugin_whale_reply_gate
+display_name: 小鲸鱼群聊回复门控
+desc: 使用 Jev 判断群聊接话与主动插话，正式回复沿用 AstrBot 的模型、人格和上下文。
+version: 0.1.0
+author: panchen00001-blip
+repo: https://github.com/panchen00001-blip/astrbot_plugin_whale_reply_gate
+support_platforms:
+  - aiocqhttp
+astrbot_version: "==4.29.3"

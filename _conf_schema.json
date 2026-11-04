@@ -1,0 +1,98 @@
+{
+  "enabled": {
+    "description": "启用群聊回复门控",
+    "type": "bool",
+    "default": true,
+    "hint": "缺少模型配置时保持待填写状态。这里和控制面板都可以修改完整配置。"
+  },
+  "log_enabled": {
+    "description": "记录门控日志",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，在 AstrBot 日志页记录消息来源、Jev 判断、主动插话条件和回复结果。关闭后停止过程日志，错误仍正常记录。"
+  },
+  "test_group_ids": {
+    "description": "启用门控的群号",
+    "type": "list",
+    "default": [],
+    "hint": "每项填写一个群号，例如分别添加 123456789 和 987654321。控制面板每行一个；JSON 示例为 [\"123456789\", \"987654321\"]。空列表不接管群消息，私聊沿用 AstrBot 原流程。"
+  },
+  "api_base": {
+    "description": "接口网址",
+    "type": "string",
+    "default": "https://api.typesafe.ai/v1",
+    "hint": "例如 https://api.typesafe.ai/v1，也可填写支持 Jev System One 的网关地址。模型列表读取 /models，判断使用 /v1/systemone。"
+  },
+  "typesafe_api_key": {
+    "description": "API Key",
+    "type": "string",
+    "default": "",
+    "hint": "填写当前服务的密钥。控制面板点击“获取模型”即可加载列表。",
+    "secret": true
+  },
+  "model": {
+    "description": "Jev 模型",
+    "type": "string",
+    "default": "jev-latest",
+    "hint": "在插件控制面板点击“获取模型”，选择后保存。安装可选前端扩展后，原生设置页也显示获取按钮。",
+    "options": [],
+    "_special": "plugin_model_picker"
+  },
+  "bot_names": {
+    "description": "小鲸鱼的称呼",
+    "type": "list",
+    "default": [
+      "小鲸鱼"
+    ],
+    "hint": "用于识别直接呼叫，也提供给 Jev 理解上下文。"
+  },
+  "dialogue_ttl_seconds": {
+    "description": "本群对话状态有效期（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "群内明确呼叫或有效续聊的正式请求被 AstrBot 接收后续期。"
+  },
+  "optional_probability": {
+    "description": "固定主动插话概率",
+    "type": "float",
+    "default": 0.3,
+    "hint": "0～1，例如 0.3 是 30%。仅用于主动插话；设为 0 仍会正常接话。"
+  },
+  "optional_cooldown_seconds": {
+    "description": "主动插话冷却（秒）",
+    "type": "int",
+    "default": 20
+  },
+  "optional_max_replies": {
+    "description": "每群任意连续 10 分钟内主动插话次数上限",
+    "type": "int",
+    "default": 10,
+    "hint": "例如设为 10，每群最近 10 分钟内成功发送的主动插话最多 10 次；达到上限后，等待旧记录超过 10 分钟再释放额度。明确呼叫和正常续聊不计入。"
+  },
+  "thresholds": {
+    "description": "Jev 判断门槛",
+    "type": "object",
+    "items": {
+      "relation": {
+        "description": "对她说话的关系门槛",
+        "type": "float",
+        "default": 0.5
+      },
+      "response_needed": {
+        "description": "需要回应门槛",
+        "type": "float",
+        "default": 0.6
+      },
+      "open_group": {
+        "description": "面向全群的关系门槛",
+        "type": "float",
+        "default": 0.7
+      },
+      "interjection_welcome": {
+        "description": "适合主动插话门槛",
+        "type": "float",
+        "default": 0.6
+      }
+    }
+  }
+}

@@ -1,0 +1,47 @@
+--- a/src/components/shared/ConfigItemRenderer.vue
++++ b/src/components/shared/ConfigItemRenderer.vue
+@@ -1,7 +1,17 @@
+ <template>
+   <div class="w-100" :class="{ 'config-field--full-width': itemMeta?.full_width }">
+     <!-- Special handling for specific metadata types -->
+-    <template v-if="itemMeta?._special === 'select_provider'">
++    <template v-if="itemMeta?._special === 'plugin_model_picker' && configRoot">
++      <PluginModelPicker
++        :model-value="modelValue"
++        :options="itemMeta.options"
++        :plugin-name="pluginName"
++        :api-base="configRoot.api_base"
++        :api-key="configRoot.typesafe_api_key"
++        @update:model-value="emitUpdate"
++      />
++    </template>
++    <template v-else-if="itemMeta?._special === 'select_provider'">
+       <ProviderSelector :model-value="modelValue" @update:model-value="emitUpdate" :provider-type="'chat_completion'" />
+     </template>
+     <template v-else-if="itemMeta?._special === 'select_provider_stt'">
+@@ -257,6 +267,7 @@
+ import FileConfigItem from './FileConfigItem.vue'
+ import ObjectEditor from './ObjectEditor.vue'
+ import ProviderSelector from './ProviderSelector.vue'
++import PluginModelPicker from './PluginModelPicker.vue'
+ import PersonaSelector from './PersonaSelector.vue'
+ import KnowledgeBaseSelector from './KnowledgeBaseSelector.vue'
+ import PluginSetSelector from './PluginSetSelector.vue'
+--- a/src/components/shared/AstrBotConfig.vue
++++ b/src/components/shared/AstrBotConfig.vue
+@@ -309,6 +309,7 @@
+                   :plugin-name="pluginName"
+                   :plugin-i18n="pluginI18n"
+                   :config-key="getItemPath(key)"
++                  :config-root="iterable"
+                   :loading="loadingEmbeddingDim"
+                   :show-fullscreen-btn="!!metadata[metadataKey].items[key]?.editor_mode"
+                   @get-embedding-dim="getEmbeddingDimensions(iterable)"
+@@ -366,6 +367,7 @@
+               :plugin-name="pluginName"
+               :plugin-i18n="pluginI18n"
+               :config-key="getItemPath(metadataKey)"
++              :config-root="iterable"
+             />
+           </ConfigDefaultReset>
+         </v-col>

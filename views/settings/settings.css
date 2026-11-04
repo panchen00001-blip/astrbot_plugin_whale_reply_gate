@@ -1,0 +1,88 @@
+:root {
+  color-scheme: light;
+  --background: #f5f6f8;
+  --surface: #fff;
+  --text: #20252d;
+  --muted: #606975;
+  --border: #cbd1d9;
+  --accent: #315fc1;
+  --error: #b42318;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --background: #181b20;
+  --surface: #22262d;
+  --text: #edf0f5;
+  --muted: #b0b9c7;
+  --border: #596372;
+  --accent: #9cbcff;
+  --error: #ffaaa1;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--text);
+  font: 15px/1.6 system-ui, sans-serif;
+}
+main { max-width: 680px; margin: 0 auto; padding: 28px 20px; }
+h1 { margin: 0; font-size: 24px; }
+header p { margin: 6px 0 22px; color: var(--muted); }
+h2 { margin: 0 0 4px; font-size: 15px; }
+.status, form {
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.status { margin-bottom: 16px; }
+.status p { margin: 0; overflow-wrap: anywhere; }
+fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+.config-group { padding: 18px; margin-bottom: 22px; border: 1px solid var(--border); border-radius: 8px; }
+.config-group legend { padding: 0 6px; font-weight: 600; }
+.config-item { margin-bottom: 18px; }
+label { display: block; margin-bottom: 6px; font-weight: 600; }
+input, textarea, select, button { font: inherit; }
+input:not([type="checkbox"]), textarea, select {
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+}
+textarea { resize: vertical; }
+input::placeholder, textarea::placeholder { color: var(--muted); }
+input:focus-visible, textarea:focus-visible, select:focus-visible, button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.hint { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+.hint:empty { display: none; }
+#fetch-models { margin-top: 8px; }
+#model-list { margin-top: 8px; }
+button {
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled, input:disabled, textarea:disabled, select:disabled { opacity: .6; cursor: wait; }
+.primary { border-color: var(--accent); background: var(--accent); color: var(--surface); }
+.toggle { display: flex; align-items: center; gap: 8px; }
+.toggle input { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
+#feedback { margin: 14px 0 0; overflow-wrap: anywhere; }
+#feedback[data-tone="error"] { color: var(--error); }
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
