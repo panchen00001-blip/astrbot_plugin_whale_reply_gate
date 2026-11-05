@@ -9,14 +9,14 @@ from typesafe_sdk import TypeSafeError
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At, Image, Plain, Reply
+from astrbot.api.message_components import At, AtAll, Image, Plain, Reply
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.tool import FunctionTool
 
 from .decision import Decision, OptionalPolicy, Thresholds, decide
 from .judge import JevJudge
-from .presence import ChatMessage, GroupDialogue
+from .presence import ChatMessage, GroupDialogue, MessageBatch
 from .settings import GateSettings
 
 
@@ -129,10 +129,15 @@ class WhaleReplyGate(Star):
             name=event.get_sender_name(),
             text="".join(part.text for part in parts if isinstance(part, Plain)),
             received_at=monotonic(),
-            mentions=[str(part.qq) for part in parts if isinstance(part, At)],
+            mentions=[
+                "all" if isinstance(part, AtAll) else str(part.qq)
+                for part in parts
+                if isinstance(part, (At, AtAll))
+            ],
             reply_to_id=str(quote.id) if quote else None,
             reply_to_sender=str(quote.sender_id) if quote else None,
-            quoted_text=(quote.message_str or "")[:200] if quote else "",
+            quoted_text=(quote.message_str or "") if quote else "",
+            images=[part for part in parts if isinstance(part, Image)],
         )
 
     def _explicit_call(self, message: ChatMessage, bot_id: str) -> bool:
@@ -176,33 +181,53 @@ class WhaleReplyGate(Star):
                 and handler.handler_name == "handle_empty_mention"
             )
         ]
-        # 第三人称提及名字、@全体成员等交给 Jev，不触发原来的自动回复。
-        event.is_at_or_wake_command = explicit
+        # 唤醒信息留在批次中，统一提交正式回复。
+        event.is_at_or_wake_command = False
         self._log_event(event, "received", explicit=explicit)
 
     @filter.event_message_type(
         filter.EventMessageType.GROUP_MESSAGE, priority=maxsize - 3
     )
     async def gate_message(self, event: AstrMessageEvent):
-        """原生群上下文入库后排队；只为 Jev 放行的消息创建新请求。"""
+        """群上下文记录后合并消息，每批使用一个回复出口。"""
         message = event.get_extra("whale_gate_message")
         if message is None:
             return
 
         group = self._group(event)
-        batch = await group.take_turn(message, event.get_extra("whale_gate_explicit"))
+        batch = await group.take_turn(
+            message,
+            event.get_extra("whale_gate_explicit"),
+            self.config["batch_wait_seconds"],
+        )
         if batch is None:
             self._log_event(event, "merged", reason="由同批次的另一条消息承接")
             event.stop_event()
             return
         if batch.explicit:
-            event.set_extra("whale_gate_source", "explicit")
-            event.is_at_or_wake_command = True
-            if not event.message_str.strip():
-                event.message_str = "用户叫了你，请自然地回应。"
+            source = "explicit"
             self._log_event(event, "explicit_reply", batch_size=len(batch.messages))
+        else:
+            source = await self._judge_batch(event, group, batch)
+        if source is None:
+            event.stop_event()
             return
 
+        event.set_extra("whale_gate_source", source)
+        event.set_extra(
+            "whale_gate_batch_senders",
+            list(dict.fromkeys(message.sender for message in batch.messages)),
+        )
+        self._log_event(
+            event, "request_reply", source=source, batch_size=len(batch.messages)
+        )
+        yield await self._reply_request(event, batch)
+        event.stop_event()
+
+    async def _judge_batch(
+        self, event: AstrMessageEvent, group: GroupDialogue, batch: MessageBatch
+    ) -> str | None:
+        """明确呼叫以外的批次，判断正常接话或主动插话。"""
         state = group.state(batch, monotonic(), self.config["dialogue_ttl_seconds"])
         state["bot"] = {
             "id": event.get_self_id(),
@@ -213,10 +238,8 @@ class WhaleReplyGate(Star):
         try:
             judgement = await self.judge.evaluate(state)
         except TypeSafeError as error:
-            # 服务错误留在管理日志里，本条群消息保持安静。
             logger.warning("[小鲸鱼门控] Jev 请求失败：%s", type(error).__name__)
             self._log_event(event, "judge_error", error=type(error).__name__)
-            event.stop_event()
             return
 
         decision = decide(judgement, self.thresholds)
@@ -235,7 +258,6 @@ class WhaleReplyGate(Star):
             elapsed_ms=round((monotonic() - started_at) * 1000),
         )
         if decision == Decision.SKIP:
-            event.stop_event()
             return
         if decision == Decision.OPTIONAL:
             allowed = group.budget.allow(monotonic(), self.optional_policy)
@@ -248,20 +270,14 @@ class WhaleReplyGate(Star):
                 max_replies=self.optional_policy.max_replies,
             )
             if not allowed:
-                event.stop_event()
                 return
-            source = "ambient"
-        else:
-            source = "follow_up"
+            return "ambient"
+        return "follow_up"
 
-        event.set_extra("whale_gate_source", source)
-        self._log_event(event, "request_reply", source=source)
-        yield await self._reply_request(event)
-        # 本条已经走过正式回复，结束事件，避免其他消息处理器再次生成。
-        event.stop_event()
-
-    async def _reply_request(self, event: AstrMessageEvent) -> ProviderRequest:
-        """沿用当前会话的人格与历史，群上下文由 AstrBot 注入。"""
+    async def _reply_request(
+        self, event: AstrMessageEvent, batch: MessageBatch
+    ) -> ProviderRequest:
+        """整批原文进入本轮输入，历史沿用 AstrBot 会话。"""
         manager = self.context.conversation_manager
         origin = event.unified_msg_origin
         cid = await manager.get_curr_conversation_id(origin)
@@ -270,14 +286,39 @@ class WhaleReplyGate(Star):
         conversation = await manager.get_conversation(origin, cid)
         images = [
             await part.convert_to_file_path()
-            for part in event.get_messages()
-            if isinstance(part, Image)
+            for message in batch.messages
+            for part in message.images
         ]
+        if len(batch.messages) == 1:
+            prompt = event.message_str.strip() or "用户叫了你，请自然地回应。"
+        else:
+            prompt = self._batch_prompt(batch)
         return event.request_llm(
-            prompt=event.message_str,
+            prompt=prompt,
             image_urls=images,
             conversation=conversation,
         )
+
+    @staticmethod
+    def _batch_prompt(batch: MessageBatch) -> str:
+        """保留原始消息顺序和来源，不拆解问题。"""
+        lines = ["以下是本轮群聊原始消息，请结合上下文自然回复一次。"]
+        image_number = 0
+        for message in batch.messages:
+            parts = [f"[{message.name} / QQ:{message.sender}]"]
+            if message.mentions:
+                parts.append(" ".join(f"@{qq}" for qq in message.mentions))
+            if message.reply_to_id:
+                parts.append(
+                    f"[引用 {message.reply_to_sender or ''} 的消息"
+                    f" {message.reply_to_id}：{message.quoted_text}]"
+                )
+            parts.append(message.text)
+            for _ in message.images:
+                image_number += 1
+                parts.append(f"[图片 {image_number}]")
+            lines.append("\n".join(parts))
+        return "\n\n".join(lines)
 
     @filter.on_llm_request(priority=-maxsize)
     async def reply_accepted(

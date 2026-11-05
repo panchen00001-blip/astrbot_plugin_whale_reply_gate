@@ -171,6 +171,7 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
             log_enabled=True,
             test_group_ids=["10001", "10002"],
             bot_names=["小鲸鱼", "鲸鱼"],
+            batch_wait_seconds=0.5,
             dialogue_ttl_seconds=180,
             optional_probability=0.2,
             optional_cooldown_seconds=60,

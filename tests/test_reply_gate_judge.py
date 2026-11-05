@@ -243,6 +243,74 @@ class JevJudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["state"], original)
         self.assertEqual(self.state, original)
 
+    async def test_large_batch_is_sent_once_with_full_context(self) -> None:
+        # 离线验证传输，不用预设响应证明模型语义。
+        follow_up = {
+            "id": "follow-up",
+            "sender": "member_B",
+            "name": "乙",
+            "text": "小鲸鱼，第二个方案预算多少？",
+            "is_bot": False,
+            "mentions": ["bot"],
+            "reply_to_id": "m2",
+            "reply_to_sender": "bot",
+            "quoted_text": "第二个性能更好",
+            "image_count": 1,
+        }
+        chatter = [
+            {
+                "id": f"chat-{index}",
+                "sender": "member_C",
+                "name": "丙",
+                "text": "同意，先这样吧",
+                "is_bot": False,
+                "mentions": ["member_A"],
+                "reply_to_id": "m1",
+                "reply_to_sender": "member_A",
+                "quoted_text": "推荐两个方案",
+                "image_count": 0,
+            }
+            for index in range(40)
+        ]
+        for active in (True, False):
+            for position in (0, 20, 40):
+                with self.subTest(active=active, position=position):
+                    self.handle_request.reset_mock()
+                    state = deepcopy(self.state)
+                    del state["current_message"]
+                    state["group_dialogue"] = {
+                        "active": active,
+                        "remaining_seconds": 100 if active else 0,
+                        "seconds_since_last_accepted_reply_request": (
+                            20 if active else 120
+                        ),
+                    }
+                    state["current_messages"] = deepcopy(chatter)
+                    state["current_messages"].insert(position, deepcopy(follow_up))
+                    original = deepcopy(state)
+
+                    await self.judge.evaluate(state)
+
+                    self.handle_request.assert_called_once()
+                    request = self.handle_request.call_args.args[0]
+                    body = json.loads(request.content)
+                    self.assertEqual(
+                        str(request.url), "https://api.typesafe.ai/v1/systemone"
+                    )
+                    self.assertEqual(body["state"], original)
+                    self.assertEqual(state, original)
+                    self.assertEqual(
+                        {
+                            key: value["type"]
+                            for key, value in body["questions"].items()
+                        },
+                        {
+                            "relation": "choice",
+                            "response_needed": "noul",
+                            "interjection_welcome": "noul",
+                        },
+                    )
+
     async def test_sdk_answers_map_to_judgement(self) -> None:
         result = await self.judge.evaluate(self.state)
         self.assertEqual(result, Judgement("to_bot", 0.85, 0.94, 0.10, 0.80))

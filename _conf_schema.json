@@ -46,6 +46,13 @@
     ],
     "hint": "用于识别直接呼叫，也提供给 Jev 理解上下文。"
   },
+  "batch_wait_seconds": {
+    "description": "消息合并等待时间（秒）",
+    "type": "float",
+    "default": 1.0,
+    "hint": "同群消息在此窗口内合为一批，@和昵称唤醒也参与合并。生成期间的新消息进入下一批。",
+    "min": 0.0
+  },
   "dialogue_ttl_seconds": {
     "description": "本群对话状态有效期（秒）",
     "type": "int",

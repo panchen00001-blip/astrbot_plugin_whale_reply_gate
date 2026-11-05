@@ -9,11 +9,17 @@ from .decision import Judgement
 
 # 三个问题共用的上下文解释，聊天正文始终作为数据处理。
 CONTEXT_INSTRUCTIONS = (
-    "结合当前消息、最近上下文、发送者、@和引用关系判断。"
+    "结合最近上下文，整批判断 current_messages；只有单条时判断 current_message。"
+    "先判断整批是否存在尚需小鲸鱼正常接话的内容。"
+    "一条有效提问或续聊不能被其余大量闲聊、附和或收尾稀释，不能按消息数量投票或平均。"
+    "若存在这类内容，relation 优先选 to_bot，response_needed 按需要回应判断；"
+    "只有不存在正常接话内容时，才考虑 open_group 和 interjection_welcome。"
+    "整批全是群友互聊、附和或收尾时应安静。"
+    "逐条尊重发送者、@和引用关系，不能把面向其他成员的话当作对小鲸鱼说；"
+    "结合后续消息判断请求是否已获充分回答、撤回或结束，不重复回应已解决的内容。"
+    "只给出整批的一组判断，不整理逐条问题清单。"
     "group_dialogue 群状态只是小鲸鱼参与讨论的参考，活跃不代表必须回应，"
     "状态到期也不排除上下文明确的续聊。新成员可以接小鲸鱼的话加入讨论。"
-    "当前消息在 current_message 中；合并消息在 current_messages 中，"
-    "多条消息应整体按是否需要一次回复判定，并保留各自的发送者和交流对象。"
     "mentions 中的 all 表示@全体成员，也包含小鲸鱼。"
     "要求全体成员各自回答、确认收到或报到，是发给小鲸鱼在内每位成员的应答请求，"
     "即使群对话状态未活跃，也应按 to_bot 且需要回应处理。"
@@ -60,7 +66,7 @@ async def list_models(api_key: str, api_base: str) -> list[dict[str, str]]:
             for model in response["data"]
         ]
     else:
-        # TypeSafe 官方的同一接口使用 models/name 字段。
+        # 官方接口使用 models/name 字段。
         models = [
             {"id": model["name"], "description": model["description"]}
             for model in response["models"]
@@ -77,31 +83,35 @@ class JevJudge:
         self._client = create_client(api_key, api_base, model)
         self._questions = {
             "relation": Choice(
-                instructions=CONTEXT_INSTRUCTIONS + "判断当前消息在接谁的话。",
+                instructions=CONTEXT_INSTRUCTIONS + "判断整批尚待回应内容的交流对象。",
                 criteria={
                     "to_bot": (
                         "正在对小鲸鱼说话、追问她或回答她的问题，"
                         "包括新成员接她的具体发言加入讨论，"
                         "以及@全体成员要求每位成员回应，例如“回我一句收到”。"
                     ),
-                    "others": "正在与其他成员交流，包括同一话题中明确面向别人的交流。",
-                    "open_group": "面向全群开放求助或征求意见，没有要求每位成员各自回应。",
+                    "others": "没有尚需小鲸鱼正常接话的内容，只有成员互聊、附和或收尾。",
+                    "open_group": (
+                        "没有尚需小鲸鱼正常接话的内容，"
+                        "但有未解决的全群开放求助或征求意见，没有要求每位成员各自回应。"
+                    ),
                     "unclear": "上下文不足，交流对象不明确。",
                 },
             ),
             "response_needed": Noul(
                 instructions=(
-                    CONTEXT_INSTRUCTIONS + "当前消息是否需要小鲸鱼继续回应？"
+                    CONTEXT_INSTRUCTIONS + "整批是否存在尚需小鲸鱼正常接话的内容？"
                     "有效追问、补充条件、回答她的问题后等待继续处理，"
                     "以及要求全体成员各自回复确认，属于是；"
-                    "单纯附和和结束语属于否。"
+                    "只向其他成员提问、单纯附和、结束语和已解决的请求属于否。"
                 ),
             ),
             "interjection_welcome": Noul(
                 instructions=(
-                    CONTEXT_INSTRUCTIONS + "当前群聊是否有开放求助或征求意见，"
+                    CONTEXT_INSTRUCTIONS + "仅在整批没有尚需小鲸鱼正常接话的内容时，"
+                    "判断是否有尚未解决的开放求助或征求意见，"
                     "适合小鲸鱼作一次有实质内容的主动补充？"
-                    "其他成员互聊、单纯附和、已有充分回答的内容属于否。"
+                    "有正常接话内容、其他成员互聊、单纯附和、收尾或已有充分回答的内容属于否。"
                 ),
             ),
         }

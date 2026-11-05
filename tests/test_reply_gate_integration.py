@@ -18,7 +18,7 @@ from typesafe_sdk import TypeSafeError
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent
-from astrbot.api.message_components import At, Plain, Reply
+from astrbot.api.message_components import At, AtAll, Image, Plain, Reply
 from astrbot.api.provider import ProviderRequest
 from astrbot.builtin_stars.astrbot.group_chat_context import GroupChatContext
 from astrbot.core.config.default import DEFAULT_CONFIG
@@ -61,6 +61,8 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.config["test_group_ids"] = ["test-group"]
         self.config["log_enabled"] = False
+        self.batch_wait_default = self.config["batch_wait_seconds"]
+        self.config["batch_wait_seconds"] = 0
         self.settings = deepcopy(DEFAULT_CONFIG)
         self.settings["provider_ltm_settings"]["active_reply"]["enable"] = False
         self.settings["provider_ltm_settings"]["group_icl_enable"] = True
@@ -100,6 +102,294 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def collect_requests(self, event):
         return [request async for request in self.plugin.gate_message(event)]
+
+    async def collect_batch(self, events):
+        async def run(event):
+            await self.prepare(event)
+            return await self.collect_requests(event)
+
+        return await asyncio.wait_for(
+            asyncio.gather(*(run(event) for event in events)), timeout=2
+        )
+
+    def process_stage(self, generate):
+        stage = ProcessStage()
+        stage.ctx = SimpleNamespace(astrbot_config=self.settings)
+        stage.star_request_sub_stage = SimpleNamespace(process=self.plugin.gate_message)
+        stage.agent_sub_stage = SimpleNamespace(process=generate)
+        return stage
+
+    async def test_default_batch_window_is_one_second(self):
+        self.assertEqual(self.batch_wait_default, 1)
+
+    async def test_window_merges_explicit_calls_and_preserves_all_inputs(self):
+        self.config["batch_wait_seconds"] = 0.02
+        self.plugin.optional_policy = OptionalPolicy(probability=0)
+        original = "预算两千，比较续航和售后。\n" * 30
+        images = [Image.fromURL(f"https://example.com/{i}.png") for i in range(3)]
+        events = [
+            make_event(
+                1, sender="10001", parts=[At(qq="bot"), Plain("先看图"), images[0]]
+            ),
+            make_event(
+                2, sender="10002", parts=[At(qq="bot"), Plain("还有这张"), images[1]]
+            ),
+            make_event(3, sender="10003", parts=[Plain("小鲸鱼，请比较"), images[2]]),
+            make_event(
+                4,
+                sender="10004",
+                parts=[
+                    Reply(id="quoted-7", sender_id="10009", message_str="旧方案含运费"),
+                    At(qq="10009"),
+                    AtAll(),
+                    Plain("这个报价也算上"),
+                ],
+            ),
+            make_event(5, text=original, sender="10001"),
+        ]
+        paths = [f"/tmp/whale-test-{i}.png" for i in range(3)]
+        with patch.object(
+            Image, "convert_to_file_path", AsyncMock(side_effect=paths)
+        ) as convert:
+            results = await self.collect_batch(events)
+        self.assertEqual([len(items) for items in results], [0, 0, 0, 0, 1])
+        request = results[-1][0]
+        self.assertIsInstance(request, ProviderRequest)
+        self.assertIs(request.conversation, self.conversation)
+        self.assertEqual(request.image_urls, paths)
+        self.assertEqual(convert.await_count, 3)
+        # 只检查输入保真，不把提示词格式当作回复质量。
+        for text in [
+            original,
+            "先看图",
+            "还有这张",
+            "小鲸鱼，请比较",
+            "这个报价也算上",
+            "旧方案含运费",
+            "quoted-7",
+            "10009",
+            "@bot",
+            "@10009",
+            "@all",
+        ]:
+            self.assertIn(text, request.prompt)
+        for sender in ["10001", "10002", "10003", "10004"]:
+            self.assertIn(sender, request.prompt)
+        self.assertEqual(events[-1].get_sender_id(), "10001")
+        self.assertEqual(
+            events[-1].get_extra("whale_gate_batch_senders"),
+            ["10001", "10002", "10003", "10004"],
+        )
+        self.assertTrue(all(event.is_stopped() for event in events))
+        self.plugin.judge.evaluate.assert_not_awaited()
+        self.assertIsNone(self.plugin._group(events[-1]).last_accepted_at)
+
+    async def test_quiet_batch_is_judged_once_and_every_event_stays_silent(self):
+        self.config["batch_wait_seconds"] = 0.02
+        self.plugin.judge.evaluate.return_value = Judgement(
+            "others", 0.99, 0.9, 0.9, 0.99
+        )
+        events = [
+            make_event(1, "周末去爬山", "A"),
+            make_event(2, "我带水", "B"),
+            make_event(3, "山顶见", "C"),
+        ]
+        self.assertEqual(await self.collect_batch(events), [[], [], []])
+        self.plugin.judge.evaluate.assert_awaited_once()
+        state = self.plugin.judge.evaluate.await_args.args[0]
+        self.assertEqual(
+            [(m["sender"], m["text"]) for m in state["current_messages"]],
+            [("A", "周末去爬山"), ("B", "我带水"), ("C", "山顶见")],
+        )
+        self.assertTrue(all(event.is_stopped() for event in events))
+        self.assertTrue(all(not event.get_result().chain for event in events))
+        self.manager.get_conversation.assert_not_awaited()
+        self.assertIsNone(self.plugin._group(events[-1]).last_accepted_at)
+
+    async def test_batch_preserves_full_quoted_message(self):
+        self.config["batch_wait_seconds"] = 0.02
+        quoted = "方案包含设备、运费和一年售后。" * 20 + "最后约定：不接受预付款。"
+        events = [
+            make_event(1, parts=[At(qq="bot"), Plain("请看这份约定")]),
+            make_event(
+                2,
+                sender="B",
+                parts=[
+                    Reply(id="agreement", sender_id="A", message_str=quoted),
+                    Plain("这个条件能接受吗？"),
+                ],
+            ),
+        ]
+        results = await self.collect_batch(events)
+        self.assertEqual([len(items) for items in results], [0, 1])
+        self.assertIn(quoted, results[-1][0].prompt)
+
+    async def test_follow_up_batch_bypasses_optional_budget_and_accepts_once(self):
+        self.config["batch_wait_seconds"] = 0.02
+        self.plugin.optional_policy = OptionalPolicy(probability=0)
+        events = [make_event(1, "第二个呢？", "A"), make_event(2, "续航多少？", "B")]
+        group = self.plugin._group(events[0])
+        group.budget.allow = Mock(return_value=False)
+        results = await self.collect_batch(events)
+        self.assertEqual([len(items) for items in results], [0, 1])
+        self.plugin.judge.evaluate.assert_awaited_once()
+        group.budget.allow.assert_not_called()
+        self.assertIsNone(group.last_accepted_at)
+        event, request = events[-1], results[-1][0]
+        self.assertEqual(event.get_extra("whale_gate_source"), "follow_up")
+        with patch.object(group, "accept_reply", wraps=group.accept_reply) as accept:
+            await self.plugin.reply_accepted(event, request)
+            await self.plugin.reply_accepted(event, request)
+        accept.assert_called_once()
+        self.assertIsNotNone(group.last_accepted_at)
+
+    async def test_process_stage_batch_never_falls_back_before_or_after_failed_send(
+        self,
+    ):
+        self.config["batch_wait_seconds"] = 0.02
+        for outcome in ["pending", "failed", "sent"]:
+            with self.subTest(outcome=outcome):
+                started, finish = asyncio.Event(), asyncio.Event()
+                calls = []
+                events = [
+                    make_event(1, group=outcome, parts=[At(qq="bot"), Plain("你好")]),
+                    make_event(2, "小鲸鱼，请比较", "B", group=outcome),
+                    make_event(3, "补充预算两千", "C", group=outcome),
+                ]
+                self.plugin.test_group_ids.add(outcome)
+
+                async def generate(event):
+                    request = event.get_extra("provider_request")
+                    calls.append((event, request))
+                    self.assertIsInstance(request, ProviderRequest)
+                    await self.plugin.reply_accepted(event, request)
+                    started.set()
+                    await finish.wait()
+                    if outcome != "pending":
+                        event.set_result(
+                            event.plain_result("批次回复").set_result_content_type(
+                                ResultContentType.LLM_RESULT
+                            )
+                        )
+                        await self.plugin.before_reply_sent(event)
+                        event._has_send_oper = outcome == "sent"
+                        await self.plugin.reply_sent(event)
+                        yield
+
+                stage = self.process_stage(generate)
+
+                async def process(event):
+                    event.is_at_or_wake_command = True
+                    await self.prepare(event)
+                    event.set_extra("activated_handlers", ["gate"])
+                    async for _ in stage.process(event):
+                        pass
+
+                tasks = [asyncio.create_task(process(event)) for event in events]
+                try:
+                    await asyncio.wait_for(started.wait(), 2)
+                    self.assertEqual(len(calls), 1)
+                    self.assertIs(calls[0][0], events[-1])
+                    self.assertFalse(events[-1]._has_send_oper)
+                    self.assertEqual(
+                        events[-1].get_extra("whale_gate_batch_senders"),
+                        ["A", "B", "C"],
+                    )
+                finally:
+                    finish.set()
+                    await asyncio.wait_for(asyncio.gather(*tasks), 2)
+                self.assertEqual(len(calls), 1)
+                self.assertTrue(all(event.is_stopped() for event in events))
+                replies = [
+                    m.text for m in self.plugin._group(events[-1]).recent if m.is_bot
+                ]
+                self.assertEqual(replies, ["批次回复"] if outcome == "sent" else [])
+        self.plugin.judge.evaluate.assert_not_awaited()
+
+    async def test_generation_keeps_new_arrivals_in_next_batch(self):
+        self.config["batch_wait_seconds"] = 0.02
+        started, finish, queued = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        requests = []
+        events = [
+            make_event(1, "小鲸鱼，先选一个", "A"),
+            make_event(2, "续航呢？", "B"),
+            make_event(3, "价格呢？", "C"),
+        ]
+
+        async def run(event):
+            await self.prepare(event)
+            if event is events[-1]:
+                queued.set()
+            async for request in self.plugin.gate_message(event):
+                requests.append((event, request))
+                if event is events[0]:
+                    started.set()
+                    await finish.wait()
+
+        first = asyncio.create_task(run(events[0]))
+        await asyncio.wait_for(started.wait(), 2)
+        following = [asyncio.create_task(run(event)) for event in events[1:]]
+        try:
+            await asyncio.wait_for(queued.wait(), 2)
+            self.assertEqual(len(requests), 1)
+            self.assertFalse(any(task.done() for task in following))
+        finally:
+            finish.set()
+            await asyncio.wait_for(asyncio.gather(first, *following), 2)
+        self.assertEqual(len(requests), 2)
+        self.assertIs(requests[-1][0], events[-1])
+        self.assertEqual(events[-1].get_extra("whale_gate_batch_senders"), ["B", "C"])
+        self.plugin.judge.evaluate.assert_awaited_once()
+        state = self.plugin.judge.evaluate.await_args.args[0]
+        self.assertEqual([m["id"] for m in state["current_messages"]], ["2", "3"])
+        self.assertEqual([m["id"] for m in state["recent_messages"]], ["1"])
+
+    async def test_ambient_batch_counts_success_once_across_tool_and_final_reply(self):
+        self.config["batch_wait_seconds"] = 0.02
+        self.plugin.optional_policy = OptionalPolicy(
+            probability=1, cooldown_seconds=0, max_replies=2
+        )
+        self.plugin.judge.evaluate.return_value = Judgement(
+            "open_group", 0.99, 0.8, 0.99, 0.9
+        )
+        events = [make_event(1, "这俩方案怎么选", "A"), make_event(2, "都挺贵", "B")]
+        group = self.plugin._group(events[0])
+        with patch.object(group.budget, "allow", wraps=group.budget.allow) as allow:
+            results = await self.collect_batch(events)
+        self.assertEqual([len(items) for items in results], [0, 1])
+        allow.assert_called_once()
+        self.plugin.judge.evaluate.assert_awaited_once()
+        event = events[-1]
+        await self.plugin.reply_accepted(event, results[-1][0])
+        self.assertIsNone(group.last_accepted_at)
+        self.assertTrue(group.budget.allow(50, self.plugin.optional_policy))
+        event.set_extra(
+            "_send_message_to_user_current_session_plain_texts", ["可以先看续航"]
+        )
+        with patch.object(
+            group.budget, "record_sent", wraps=group.budget.record_sent
+        ) as record:
+            with patch(
+                "astrbot_plugin_whale_reply_gate.main.monotonic", return_value=50
+            ):
+                await self.plugin.tool_reply_sent(event, Mock(), {}, None)
+                await self.plugin.tool_reply_sent(event, Mock(), {}, None)
+                event.set_result(
+                    event.plain_result("价格也需要考虑").set_result_content_type(
+                        ResultContentType.LLM_RESULT
+                    )
+                )
+                await self.plugin.before_reply_sent(event)
+                event._has_send_oper = True
+                await self.plugin.reply_sent(event)
+                await self.plugin.reply_sent(event)
+            record.assert_called_once_with(50)
+        self.assertEqual(
+            [m.text for m in group.recent if m.is_bot],
+            ["可以先看续航", "价格也需要考虑"],
+        )
+        self.assertTrue(group.budget.allow(51, self.plugin.optional_policy))
+        self.assertIsNone(group.last_accepted_at)
 
     async def test_disabled_private_outside_group_and_commands_remain_native(self):
         private = make_event(group="")
@@ -241,7 +531,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.config.schema["model"]["options"], ["jev-latest", "jev-preview"]
         )
 
-    async def test_explicit_mentions_name_and_quote_follow_native_route(self):
+    async def test_explicit_calls_use_one_plugin_request(self):
         cases = [
             [At(qq="bot"), Plain("你好")],
             [Plain("小鲸鱼你好")],
@@ -252,9 +542,10 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         async def run(parts, number):
             event = make_event(number, parts=parts)
             await self.prepare(event)
-            self.assertEqual(await self.collect_requests(event), [])
-            self.assertTrue(event.is_at_or_wake_command)
+            self.assertEqual(len(await self.collect_requests(event)), 1)
+            self.assertFalse(event.is_at_or_wake_command)
             self.assertEqual(event.get_extra("whale_gate_source"), "explicit")
+            self.assertTrue(event.is_stopped())
 
         for index, parts in enumerate(cases):
             await asyncio.create_task(run(parts, index))
@@ -317,9 +608,11 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.prepare(event)
         self.assertEqual(handlers, [context_handler])
         self.assertIs(event.get_extra("enable_streaming"), False)
-        self.assertEqual(await self.collect_requests(event), [])
+        requests = await self.collect_requests(event)
+        self.assertEqual(len(requests), 1)
         self.assertEqual(event.get_extra("whale_gate_source"), "explicit")
-        self.assertTrue(event.message_str)
+        self.assertTrue(requests[0].prompt)
+        self.assertFalse(event.is_at_or_wake_command)
         self.assertIsNotNone(self.plugin._group(event)._active_task)
 
     async def test_request_preserves_conversation_and_uses_native_group_context(self):
