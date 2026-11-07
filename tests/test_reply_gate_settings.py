@@ -174,6 +174,7 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
             batch_wait_seconds=0.5,
             dialogue_ttl_seconds=180,
             optional_probability=0.2,
+            casual_probability=0.1,
             optional_cooldown_seconds=60,
             optional_max_replies=3,
             thresholds={

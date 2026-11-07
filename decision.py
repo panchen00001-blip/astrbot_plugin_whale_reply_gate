@@ -19,7 +19,7 @@ class Judgement:
 class Decision(StrEnum):
     REPLY = "REPLY"
     OPTIONAL = "OPTIONAL"
-    SKIP = "SKIP"
+    CASUAL = "CASUAL"
 
 
 @dataclass
@@ -31,7 +31,7 @@ class Thresholds:
 
 
 def decide(judgement: Judgement, thresholds: Thresholds) -> Decision:
-    """使用所选关系的判断概率；confidence 只用于观察。"""
+    """只做语义分类，随机概率与额度由门控处理。"""
     if (
         judgement.relation == "to_bot"
         and judgement.relation_probability >= thresholds.relation
@@ -46,7 +46,7 @@ def decide(judgement: Judgement, thresholds: Thresholds) -> Decision:
     ):
         return Decision.OPTIONAL
 
-    return Decision.SKIP
+    return Decision.CASUAL
 
 
 @dataclass
@@ -64,6 +64,7 @@ class OptionalBudget:
         self._sent_at: deque[float] = deque()
         # 冷却记录独立保存，不随统计窗口清空。
         self._last_sent_at: float | None = None
+        self.last_reason = "not_checked"
 
     def allow(
         self,
@@ -80,12 +81,16 @@ class OptionalBudget:
             self._last_sent_at is not None
             and now - self._last_sent_at < policy.cooldown_seconds
         ):
+            self.last_reason = "cooldown"
             return False
 
         if len(self._sent_at) >= policy.max_replies:
+            self.last_reason = "limit"
             return False
 
-        return draw() < policy.probability
+        allowed = draw() < policy.probability
+        self.last_reason = "allowed" if allowed else "probability"
+        return allowed
 
     def record_sent(self, now: float) -> None:
         """成功发送后计数，并从此刻开始冷却。"""

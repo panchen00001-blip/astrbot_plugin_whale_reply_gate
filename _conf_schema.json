@@ -63,18 +63,25 @@
     "description": "固定主动插话概率",
     "type": "float",
     "default": 0.3,
-    "hint": "0～1，例如 0.3 是 30%。仅用于主动插话；设为 0 仍会正常接话。"
+    "hint": "用于适合主动回应的群话题，0 关闭，1 必定通过概率检查。两概率独立，每批按分类择一，不叠加、不相乘；明确呼叫和正常接话不受影响。"
+  },
+  "casual_probability": {
+    "description": "随机闲聊概率",
+    "type": "float",
+    "default": 0.05,
+    "hint": "用于 Jev 判无须应答批次的随机参与，抽中后按人设简短接话；0 保持安静。主动回应和随机闲聊共享冷却与十分钟次数额度。"
   },
   "optional_cooldown_seconds": {
     "description": "主动插话冷却（秒）",
     "type": "int",
-    "default": 20
+    "default": 20,
+    "hint": "主动回应和随机闲聊共用冷却，成功发送后计算；两类都不续期群对话状态。"
   },
   "optional_max_replies": {
     "description": "每群任意连续 10 分钟内主动插话次数上限",
     "type": "int",
     "default": 10,
-    "hint": "例如设为 10，每群最近 10 分钟内成功发送的主动插话最多 10 次；达到上限后，等待旧记录超过 10 分钟再释放额度。明确呼叫和正常续聊不计入。"
+    "hint": "主动回应和随机闲聊共用额度。例如设为 10，每群最近 10 分钟内两类成功发送合计最多 10 次，旧记录超过 10 分钟后释放额度。明确呼叫和正常接话不计入。"
   },
   "thresholds": {
     "description": "Jev 判断门槛",
@@ -83,23 +90,28 @@
       "relation": {
         "description": "对她说话的关系门槛",
         "type": "float",
-        "default": 0.5
+        "default": 0.5,
+        "hint": "判断内容面向机器人的把握程度。"
       },
       "response_needed": {
         "description": "需要回应门槛",
         "type": "float",
-        "default": 0.6
+        "default": 0.6,
+        "hint": "判断内容需要正常接话的程度。"
       },
       "open_group": {
         "description": "面向全群的关系门槛",
         "type": "float",
-        "default": 0.7
+        "default": 0.7,
+        "hint": "判断话题面向全群的把握程度。"
       },
       "interjection_welcome": {
         "description": "适合主动插话门槛",
         "type": "float",
-        "default": 0.6
+        "default": 0.6,
+        "hint": "判断开放话题适合主动补充的程度。"
       }
-    }
+    },
+    "hint": "决定正常接话、主动回应或随机闲聊分类：前两个门槛判断正常接话，后两个判断主动回应，其余归为随机闲聊，并使用对应概率。"
   }
 }

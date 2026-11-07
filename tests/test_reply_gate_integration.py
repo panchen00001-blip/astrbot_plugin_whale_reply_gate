@@ -21,6 +21,11 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import At, AtAll, Image, Plain, Reply
 from astrbot.api.provider import ProviderRequest
 from astrbot.builtin_stars.astrbot.group_chat_context import GroupChatContext
+from astrbot.core.agent.message import (
+    TextPart,
+    bind_checkpoint_messages,
+    dump_messages_with_checkpoints,
+)
 from astrbot.core.config.default import DEFAULT_CONFIG
 from astrbot.core.db.po import Conversation
 from astrbot.core.message.message_event_result import ResultContentType
@@ -61,6 +66,8 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.config["test_group_ids"] = ["test-group"]
         self.config["log_enabled"] = False
+        self.config["optional_probability"] = 0
+        self.config["casual_probability"] = 0
         self.batch_wait_default = self.config["batch_wait_seconds"]
         self.config["batch_wait_seconds"] = 0
         self.settings = deepcopy(DEFAULT_CONFIG)
@@ -118,6 +125,339 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         stage.star_request_sub_stage = SimpleNamespace(process=self.plugin.gate_message)
         stage.agent_sub_stage = SimpleNamespace(process=generate)
         return stage
+
+    async def process_batch_offline(self, events):
+        calls = []
+
+        async def generate(event):
+            request = event.get_extra("provider_request")
+            self.assertIsInstance(request, ProviderRequest)
+            calls.append((event, request))
+            await self.plugin.reply_accepted(event, request)
+            # 未发送时也不能回落到原生生成。
+            yield
+
+        stage = self.process_stage(generate)
+
+        async def process(event):
+            event.is_at_or_wake_command = True
+            await self.prepare(event)
+            event.set_extra("activated_handlers", ["gate"])
+            async for _ in stage.process(event):
+                pass
+
+        await asyncio.wait_for(
+            asyncio.gather(*(process(event) for event in events)), timeout=2
+        )
+        self.assertTrue(all(event.is_stopped() for event in events))
+        return calls
+
+    async def test_random_branches_draw_once_per_batch_and_generate_only_on_hit(self):
+        self.config["batch_wait_seconds"] = 0.02
+        cases = [
+            ("casual-zero", "others", 1, 0, 0, None),
+            ("casual-one", "others", 0, 1, 0.999999, "casual"),
+            ("casual-miss", "unclear", 1, 0.3, 0.3, None),
+            ("ambient-zero", "open_group", 0, 1, 0, None),
+            ("ambient-one", "open_group", 1, 0, 0.999999, "ambient"),
+            ("ambient-miss", "open_group", 0.3, 1, 0.3, None),
+            ("casual-independent", "others", 0.2, 0.7, 0.65, "casual"),
+            ("ambient-independent", "open_group", 0.7, 0.2, 0.65, "ambient"),
+        ]
+        for group_id, relation, optional, casual, draw_value, source in cases:
+            with self.subTest(group=group_id):
+                self.plugin.test_group_ids.add(group_id)
+                self.config["optional_probability"] = optional
+                self.config["casual_probability"] = casual
+                original_policy = OptionalPolicy(probability=optional)
+                original_values = vars(original_policy).copy()
+                self.plugin.optional_policy = original_policy
+                self.config["log_enabled"] = True
+                self.plugin.logger = Mock()
+                self.plugin.judge.evaluate.reset_mock()
+                self.plugin.judge.evaluate.return_value = Judgement(
+                    relation, 0.99, 0.99, 0.99, 0.99
+                )
+                events = [
+                    make_event(1, "周末去爬山", "A", group_id),
+                    make_event(2, "我带水", "B", group_id),
+                    make_event(3, "山顶见", "C", group_id),
+                ]
+                budget = self.plugin._group(events[0]).budget
+                draw = Mock(return_value=draw_value)
+                real_allow = budget.allow
+                with patch.object(
+                    budget,
+                    "allow",
+                    side_effect=lambda now, policy: real_allow(now, policy, draw),
+                ) as allow:
+                    calls = await self.process_batch_offline(events)
+                allow.assert_called_once()
+                effective_policy = allow.call_args.args[1]
+                probability = optional if relation == "open_group" else casual
+                self.assertEqual(effective_policy.probability, probability)
+                self.assertEqual(
+                    vars(effective_policy),
+                    {**original_values, "probability": probability},
+                )
+                self.assertIs(self.plugin.optional_policy, original_policy)
+                self.assertEqual(vars(original_policy), original_values)
+                checks = [
+                    call.args[-1]
+                    for call in self.plugin.logger.info.call_args_list
+                    if call.args[1] == "optional_check"
+                ]
+                self.assertEqual(len(checks), 1)
+                self.assertEqual(checks[0]["probability"], probability)
+                self.assertEqual(
+                    checks[0]["decision"],
+                    "OPTIONAL" if relation == "open_group" else "CASUAL",
+                )
+                self.assertIs(checks[0]["allowed"], source is not None)
+                self.assertEqual(
+                    checks[0]["reason"],
+                    "allowed" if source is not None else "probability",
+                )
+                draw.assert_called_once_with()
+                self.plugin.judge.evaluate.assert_awaited_once()
+                self.assertEqual(len(calls), int(source is not None))
+                if source is not None:
+                    self.assertIs(calls[0][0], events[-1])
+                    self.assertEqual(events[-1].get_extra("whale_gate_source"), source)
+                else:
+                    self.assertTrue(
+                        all(not event.get_result().chain for event in events)
+                    )
+
+    async def test_casual_uses_existing_optional_cooldown_and_limit(self):
+        self.config["casual_probability"] = 1
+        for group_id, sent_at, now, policy in [
+            ("cooldown", [50], 69.999, OptionalPolicy(probability=1)),
+            (
+                "limit",
+                [10, 30],
+                100,
+                OptionalPolicy(probability=1, cooldown_seconds=0, max_replies=2),
+            ),
+        ]:
+            with self.subTest(group=group_id):
+                self.plugin.test_group_ids.add(group_id)
+                self.plugin.optional_policy = policy
+                self.plugin.judge.evaluate.return_value = Judgement(
+                    "others", 0.99, 0.99, 0.99, 0.99
+                )
+                event = make_event(group=group_id)
+                group = self.plugin._group(event)
+                for sent in sent_at:
+                    group.budget.record_sent(sent)
+                draw = Mock(return_value=0)
+                real_allow = group.budget.allow
+                with (
+                    patch.object(
+                        group.budget,
+                        "allow",
+                        side_effect=lambda time, policy: real_allow(time, policy, draw),
+                    ) as allow,
+                    patch(
+                        "astrbot_plugin_whale_reply_gate.main.monotonic",
+                        return_value=now,
+                    ),
+                ):
+                    self.assertEqual(await self.process_batch_offline([event]), [])
+                allow.assert_called_once()
+                draw.assert_not_called()
+
+    async def test_explicit_and_follow_up_never_draw_even_with_full_budget(self):
+        for number, explicit in enumerate([False, True], 1):
+            event = make_event(number, text="小鲸鱼你好" if explicit else "第二个呢？")
+            group = self.plugin._group(event)
+            self.plugin.optional_policy = OptionalPolicy(probability=0, max_replies=0)
+            self.plugin.judge.evaluate.reset_mock()
+            with patch.object(group.budget, "allow", return_value=False) as allow:
+                calls = await self.process_batch_offline([event])
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(
+                event.get_extra("whale_gate_source"),
+                "explicit" if explicit else "follow_up",
+            )
+            allow.assert_not_called()
+            if explicit:
+                self.plugin.judge.evaluate.assert_not_awaited()
+            else:
+                self.plugin.judge.evaluate.assert_awaited_once()
+
+    async def test_judge_failure_never_draws_or_generates(self):
+        self.config["casual_probability"] = 1
+        self.plugin.optional_policy = OptionalPolicy(probability=1)
+        self.plugin.judge.evaluate.side_effect = TypeSafeError("offline failure")
+        event = make_event()
+        group = self.plugin._group(event)
+        with patch.object(group.budget, "allow", wraps=group.budget.allow) as allow:
+            self.assertEqual(await self.process_batch_offline([event]), [])
+        allow.assert_not_called()
+        self.assertIsNone(group.last_accepted_at)
+
+    async def test_image_only_casual_preserves_input_without_inventing_a_call(self):
+        self.config["casual_probability"] = 1
+        self.assertEqual(self.config["optional_probability"], 0)
+        self.assertEqual(self.plugin.optional_policy.probability, 0)
+        self.plugin.judge.evaluate.return_value = Judgement("others", 1, 1, 1, 1)
+        picture = Image.fromURL("https://example.com/scenery.png")
+        event = make_event(text="", parts=[picture])
+        image_path = "/tmp/whale-test-casual-image.png"
+        with patch.object(
+            Image, "convert_to_file_path", AsyncMock(return_value=image_path)
+        ) as convert:
+            calls = await self.process_batch_offline([event])
+        self.assertEqual(len(calls), 1)
+        self.plugin.judge.evaluate.assert_awaited_once()
+        state = self.plugin.judge.evaluate.await_args.args[0]
+        self.assertEqual(state["current_message"]["text"], "")
+        self.assertEqual(state["current_message"]["image_count"], 1)
+        self.assertEqual(event.message_str, "")
+        self.assertEqual(event.message_obj.message, [picture])
+        self.assertFalse(event.get_extra("whale_gate_explicit"))
+        self.assertEqual(event.get_extra("whale_gate_source"), "casual")
+        request = calls[0][1]
+        convert.assert_awaited_once_with()
+        self.assertEqual(request.image_urls, [image_path])
+        # 空正文只补中性输入，不虚构用户呼叫。
+        self.assertEqual(request.prompt, "请结合收到的消息自然回应。")
+        self.assertEqual(len(request.extra_user_content_parts), 1)
+        intent = request.extra_user_content_parts[0]
+        self.assertIsInstance(intent, TextPart)
+        self.assertTrue(intent._no_save)
+        self.assertIn("随机", intent.text)
+        self.assertIn("群聊", intent.text)
+        self.assertNotIn("用户叫了你", request.prompt + intent.text)
+        self.assertIsNone(self.plugin._group(event).last_accepted_at)
+
+    async def test_casual_intent_reaches_model_but_is_removed_from_history(self):
+        self.config["casual_probability"] = 1
+        self.plugin.optional_policy = OptionalPolicy(probability=1)
+        self.plugin.judge.evaluate.return_value = Judgement("others", 1, 1, 1, 1)
+        event = make_event(text="今天终于放晴了")
+        calls = await self.process_batch_offline([event])
+        self.assertEqual(len(calls), 1)
+        request = calls[0][1]
+        self.assertEqual(request.prompt, "今天终于放晴了")
+        self.assertEqual(len(request.extra_user_content_parts), 1)
+        intent = request.extra_user_content_parts[0]
+        self.assertIsInstance(intent, TextPart)
+        self.assertTrue(intent.text.strip())
+        self.assertTrue(intent._no_save)
+        original_history = self.conversation.history
+        await self.group_context.on_req_llm(event, request)
+        assembled = await request.assemble_context()
+        messages = bind_checkpoint_messages([assembled])
+        # 模型序列化保留意图，历史序列化只保留原文和正常上下文。
+        provider_message = messages[0].model_dump()
+        self.assertIn(intent.model_dump(), provider_message["content"])
+        persisted = dump_messages_with_checkpoints(messages)
+        self.assertEqual(
+            len(persisted[0]["content"]), len(provider_message["content"]) - 1
+        )
+        self.assertNotIn(intent.model_dump(), persisted[0]["content"])
+        self.assertIn({"type": "text", "text": request.prompt}, persisted[0]["content"])
+        self.assertEqual(self.conversation.history, original_history)
+        self.assertEqual(request.prompt, "今天终于放晴了")
+
+    async def test_casual_success_counts_once_without_renewing_existing_presence(self):
+        self.config["casual_probability"] = 1
+        self.plugin.optional_policy = OptionalPolicy(probability=1)
+        self.plugin.judge.evaluate.return_value = Judgement("others", 1, 1, 1, 1)
+        event = make_event()
+        group = self.plugin._group(event)
+        group.accept_reply(10)
+        with patch("astrbot_plugin_whale_reply_gate.main.monotonic", return_value=50):
+            calls = await self.process_batch_offline([event])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(event.get_extra("whale_gate_source"), "casual")
+        self.assertEqual(group.last_accepted_at, 10)
+        event.set_result(
+            event.plain_result("山顶风景应该不错").set_result_content_type(
+                ResultContentType.LLM_RESULT
+            )
+        )
+        with (
+            patch.object(
+                group.budget, "record_sent", wraps=group.budget.record_sent
+            ) as record,
+            patch("astrbot_plugin_whale_reply_gate.main.monotonic", return_value=50),
+        ):
+            await self.plugin.before_reply_sent(event)
+            await self.plugin.reply_sent(event)
+            record.assert_not_called()
+            event.set_extra(
+                "_send_message_to_user_current_session_plain_texts", ["记得带水"]
+            )
+            await self.plugin.tool_reply_sent(event, Mock(), {}, None)
+            await self.plugin.tool_reply_sent(event, Mock(), {}, None)
+            await self.plugin.before_reply_sent(event)
+            event._has_send_oper = True
+            await self.plugin.reply_sent(event)
+            await self.plugin.reply_sent(event)
+            record.assert_called_once_with(50)
+        self.assertEqual(group.last_accepted_at, 10)
+        self.assertEqual(
+            [m.text for m in group.recent if m.is_bot],
+            ["记得带水", "山顶风景应该不错"],
+        )
+        self.assertFalse(group.budget.allow(51, self.plugin.optional_policy))
+
+    async def test_ambient_and_casual_share_budget_after_successful_final_send(self):
+        self.config["casual_probability"] = 1
+        cases = [
+            ("ambient-cooldown", "open_group", "others", 20, 10),
+            ("casual-cooldown", "others", "open_group", 20, 10),
+            ("ambient-limit", "open_group", "others", 0, 1),
+            ("casual-limit", "others", "open_group", 0, 1),
+        ]
+        for group_id, first_relation, next_relation, cooldown, limit in cases:
+            with self.subTest(group=group_id):
+                self.plugin.test_group_ids.add(group_id)
+                self.plugin.optional_policy = OptionalPolicy(
+                    probability=1, cooldown_seconds=cooldown, max_replies=limit
+                )
+                first = make_event(1, group=group_id)
+                group = self.plugin._group(first)
+                self.plugin.judge.evaluate.return_value = Judgement(
+                    first_relation, 1, 1, 1, 1
+                )
+                with (
+                    patch(
+                        "astrbot_plugin_whale_reply_gate.main.monotonic",
+                        return_value=50,
+                    ),
+                    patch.object(
+                        group.budget, "record_sent", wraps=group.budget.record_sent
+                    ) as record,
+                ):
+                    self.assertEqual(len(await self.process_batch_offline([first])), 1)
+                    record.assert_not_called()
+                    first.set_result(
+                        first.plain_result("记得带水").set_result_content_type(
+                            ResultContentType.LLM_RESULT
+                        )
+                    )
+                    await self.plugin.before_reply_sent(first)
+                    first._has_send_oper = True
+                    await self.plugin.reply_sent(first)
+                    await self.plugin.reply_sent(first)
+                    record.assert_called_once_with(50)
+                self.assertIsNone(group.last_accepted_at)
+                self.plugin.judge.evaluate.return_value = Judgement(
+                    next_relation, 1, 1, 1, 1
+                )
+                with patch(
+                    "astrbot_plugin_whale_reply_gate.main.monotonic", return_value=51
+                ):
+                    self.assertEqual(
+                        await self.process_batch_offline(
+                            [make_event(2, group=group_id)]
+                        ),
+                        [],
+                    )
 
     async def test_default_batch_window_is_one_second(self):
         self.assertEqual(self.batch_wait_default, 1)
@@ -649,7 +989,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(group.last_accepted_at, 42)
         await generator.aclose()
 
-    async def test_skip_and_api_failure_create_no_reply_or_presence(self):
+    async def test_casual_zero_probability_and_api_failure_stay_silent(self):
         async def run(number):
             event = make_event(number)
             await self.prepare(event)

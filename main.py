@@ -1,6 +1,7 @@
 """把 Jev 门控接入 AstrBot 的原生回复流程。"""
 
 import re
+from dataclasses import replace
 from sys import maxsize
 from time import monotonic
 
@@ -12,6 +13,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, AtAll, Image, Plain, Reply
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
+from astrbot.core.agent.message import TextPart
 from astrbot.core.agent.tool import FunctionTool
 
 from .decision import Decision, OptionalPolicy, Thresholds, decide
@@ -257,22 +259,28 @@ class WhaleReplyGate(Star):
             batch_size=len(batch.messages),
             elapsed_ms=round((monotonic() - started_at) * 1000),
         )
-        if decision == Decision.SKIP:
+        if decision == Decision.REPLY:
+            return "follow_up"
+
+        policy = self.optional_policy
+        if decision == Decision.CASUAL:
+            policy = replace(policy, probability=self.config["casual_probability"])
+        allowed = group.budget.allow(monotonic(), policy)
+        self._log_event(
+            event,
+            "optional_check",
+            decision=decision.value,
+            allowed=allowed,
+            reason=group.budget.last_reason,
+            probability=policy.probability,
+            cooldown_seconds=policy.cooldown_seconds,
+            max_replies=policy.max_replies,
+        )
+        if not allowed:
             return
         if decision == Decision.OPTIONAL:
-            allowed = group.budget.allow(monotonic(), self.optional_policy)
-            self._log_event(
-                event,
-                "optional_check",
-                allowed=allowed,
-                probability=self.optional_policy.probability,
-                cooldown_seconds=self.optional_policy.cooldown_seconds,
-                max_replies=self.optional_policy.max_replies,
-            )
-            if not allowed:
-                return
             return "ambient"
-        return "follow_up"
+        return "casual"
 
     async def _reply_request(
         self, event: AstrMessageEvent, batch: MessageBatch
@@ -290,14 +298,22 @@ class WhaleReplyGate(Star):
             for part in message.images
         ]
         if len(batch.messages) == 1:
-            prompt = event.message_str.strip() or "用户叫了你，请自然地回应。"
+            prompt = event.message_str.strip() or "请结合收到的消息自然回应。"
         else:
             prompt = self._batch_prompt(batch)
-        return event.request_llm(
+        request = event.request_llm(
             prompt=prompt,
             image_urls=images,
             conversation=conversation,
         )
+        if event.get_extra("whale_gate_source") == "casual":
+            request.extra_user_content_parts.append(
+                TextPart(
+                    text="这轮是你随机参与群聊。结合原始消息和当前人设，"
+                    "简短、自然地接一句相关的话；未有人提问时以闲聊语气回应。"
+                ).mark_as_temp()
+            )
+        return request
 
     @staticmethod
     def _batch_prompt(batch: MessageBatch) -> str:
@@ -400,9 +416,10 @@ class WhaleReplyGate(Star):
                 is_bot=True,
             )
         )
-        if event.get_extra("whale_gate_source") == "ambient" and not event.get_extra(
-            "whale_gate_sent", False
-        ):
+        if event.get_extra("whale_gate_source") in {
+            "ambient",
+            "casual",
+        } and not event.get_extra("whale_gate_sent", False):
             group.budget.record_sent(now)
         event.set_extra("whale_gate_last_sent_text", text)
         event.set_extra("whale_gate_sent", True)
